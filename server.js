@@ -2,19 +2,21 @@ const express = require("express");
 const path = require("path");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const cookieParser = require("cookie-parser");
+const { randomUUID } = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Hidden flag is ROT13-encoded so the leak is not obvious at first glance.
 const flag = process.env.FLAG || "ZZQP{ebg13_vf_rnfl}";
-// Index tracks which character to leak next; kept in memory only for simplicity.
-let leakIndex = 0;
-const todos = [];
+// State is per-user (cookie-based) so each visitor gets a fresh slate and leak sequence.
+const userState = new Map();
 
 // Global safety middleware: headers + light request throttling for abuse reduction.
 app.use(helmet());
 app.use(express.json());
+app.use(cookieParser());
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -34,8 +36,27 @@ const addTodoLimiter = rateLimit({
   message: { message: "Too many todo submissions, try again shortly." }
 });
 
+// Ensure each visitor has a per-user state bucket keyed by httpOnly cookie.
+app.use((req, res, next) => {
+  let userId = req.cookies.userId;
+  if (!userId) {
+    userId = randomUUID();
+    res.cookie("userId", userId, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production"
+    });
+  }
+  if (!userState.has(userId)) {
+    userState.set(userId, { todos: [], leakIndex: 0 });
+  }
+  req.userId = userId;
+  req.userData = userState.get(userId);
+  next();
+});
+
 app.get("/todos", (req, res) => {
-  res.json({ todos });
+  res.json({ todos: req.userData.todos });
 });
 
 app.post("/add-todo", addTodoLimiter, (req, res) => {
@@ -51,14 +72,20 @@ app.post("/add-todo", addTodoLimiter, (req, res) => {
       .json({ message: "Todo must be 200 characters or fewer", todos });
   }
 
-  todos.push(cleaned);
+  req.userData.todos.push(cleaned);
 
   // Leak exactly one character from the encoded flag each time a todo is added.
-  const leakChar = leakIndex < flag.length ? flag[leakIndex] : "";
-  leakIndex += 1;
+  const leakChar =
+    req.userData.leakIndex < flag.length ? flag[req.userData.leakIndex] : "";
+  req.userData.leakIndex += 1;
 
   // debug field makes the leak discoverable via network inspection; UI ignores it.
-  res.json({ message: "Todo added!", todo: cleaned, debug: leakChar, todos });
+  res.json({
+    message: "Todo added!",
+    todo: cleaned,
+    debug: leakChar,
+    todos: req.userData.todos
+  });
 });
 
 app.use((err, req, res, next) => {
